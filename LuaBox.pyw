@@ -5,19 +5,23 @@ import tempfile
 import os
 import fnmatch
 import random
+import socket
+import threading
+import struct
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QTextEdit, QVBoxLayout,
     QHBoxLayout, QWidget, QPushButton, QLabel, QSplitter,
     QPlainTextEdit, QStatusBar, QFileDialog, QTreeWidget,
     QTreeWidgetItem, QTabWidget, QMessageBox, QDialog,
-    QFormLayout, QComboBox, QSpinBox, QCheckBox, QMenu
+    QFormLayout, QComboBox, QSpinBox, QCheckBox, QMenu,
+    QLineEdit, QRadioButton, QButtonGroup, QScrollBar
 )
 from PyQt6.QtGui import (
     QFont, QColor, QTextCharFormat, QSyntaxHighlighter,
     QPainter, QTextFormat, QAction, QIcon, QTextDocument
 )
-from PyQt6.QtCore import Qt, QRect, QSize, QDir, QUrl, QEventLoop
+from PyQt6.QtCore import Qt, QRect, QSize, QDir, QUrl, QEventLoop, QProcess, QProcessEnvironment
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore import QWebEngineSettings
 
@@ -73,7 +77,7 @@ THEMES = {
         # Accent buttons
         "btn_settings":    "#E8D6F0",
         "btn_format":      "#E6F3FF",
-        "btn_obfuscate":   "#FFE6E6",
+        "btn_bridge":      "#E6FFE8",
     },
     "Dark": {
         # General UI
@@ -122,7 +126,7 @@ THEMES = {
         # Accent buttons
         "btn_settings":    "#3D2B4F",
         "btn_format":      "#1B3A5C",
-        "btn_obfuscate":   "#4A1F1F",
+        "btn_bridge":      "#1A3D25",
     },
 }
 
@@ -991,773 +995,6 @@ class FindReplaceDialog(QDialog):
 
 
 # --- Obfuscator Dialog ---
-class ObfuscatorDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Obfuscator")
-        self.setModal(True)
-        self.setMinimumWidth(500)
-        
-        layout = QVBoxLayout()
-        
-        # Title
-        title = QLabel("Obfuscate")
-        title.setStyleSheet("font-size: 14pt; font-weight: bold; color: #E81123;")
-        layout.addWidget(title)
-        
-        desc = QLabel("Select obfuscation options below:")
-        desc.setStyleSheet("color: #666666; margin-bottom: 10px;")
-        desc.setWordWrap(True)
-        layout.addWidget(desc)
-        
-        # Preset selection
-        preset_layout = QHBoxLayout()
-        preset_label = QLabel("Preset:")
-        preset_label.setMinimumWidth(120)
-        self.preset_combo = QComboBox()
-        self.preset_combo.addItems(["Light", "Medium", "Heavy", "Maximum", "Custom"])
-        self.preset_combo.currentTextChanged.connect(self.apply_preset)
-        preset_layout.addWidget(preset_label)
-        preset_layout.addWidget(self.preset_combo)
-        preset_layout.addStretch()
-        layout.addLayout(preset_layout)
-        
-        layout.addSpacing(10)
-        
-        # Options group
-        options_group = QWidget()
-        options_layout = QVBoxLayout(options_group)
-        options_layout.setContentsMargins(10, 10, 10, 10)
-        options_group.setStyleSheet("QWidget { background-color: #F5F5F5; border-radius: 5px; }")
-        
-        # Variable renaming
-        self.rename_vars = QCheckBox("Rename Variables")
-        self.rename_vars.setChecked(True)
-        self.rename_vars.setToolTip("Rename local variables to random meaningless names")
-        options_layout.addWidget(self.rename_vars)
-        
-        # String encoding
-        self.encode_strings = QCheckBox("Encode Strings")
-        self.encode_strings.setChecked(True)
-        self.encode_strings.setToolTip("Convert strings to byte arrays or encoded format")
-        options_layout.addWidget(self.encode_strings)
-        
-        # Number encoding
-        self.encode_numbers = QCheckBox("Encode Numbers")
-        self.encode_numbers.setChecked(False)
-        self.encode_numbers.setToolTip("Obfuscate numeric literals")
-        options_layout.addWidget(self.encode_numbers)
-        
-        # Control flow
-        self.control_flow = QCheckBox("Control Flow Obfuscation")
-        self.control_flow.setChecked(True)
-        self.control_flow.setToolTip("Add fake conditional branches and complex control flow")
-        options_layout.addWidget(self.control_flow)
-        
-        # Dead code
-        self.add_junk = QCheckBox("Insert Junk Code")
-        self.add_junk.setChecked(False)
-        self.add_junk.setToolTip("Add random non-functional code")
-        options_layout.addWidget(self.add_junk)
-        
-        # Minify
-        self.minify = QCheckBox("Minify (Remove Whitespace)")
-        self.minify.setChecked(True)
-        self.minify.setToolTip("Remove all unnecessary whitespace and comments")
-        options_layout.addWidget(self.minify)
-        
-        # Anti-debug
-        self.anti_debug = QCheckBox("Anti-Debug Protection")
-        self.anti_debug.setChecked(False)
-        self.anti_debug.setToolTip("Add anti-debugging and anti-tampering checks")
-        options_layout.addWidget(self.anti_debug)
-        
-        # Wrap in function
-        self.wrap_function = QCheckBox("Wrap in Anonymous Function")
-        self.wrap_function.setChecked(True)
-        self.wrap_function.setToolTip("Wrap entire code in a self-executing function")
-        options_layout.addWidget(self.wrap_function)
-
-        # ProxifyLocals
-        self.proxify_locals = QCheckBox("Proxify Locals  [Prometheus]")
-        self.proxify_locals.setChecked(False)
-        self.proxify_locals.setToolTip(
-            "Wrap local variables in metatable proxy objects so reads/writes go through "
-            "__index/__newindex metamethods (inspired by Prometheus ProxifyLocals)"
-        )
-        self.proxify_locals.setStyleSheet("color: #6600CC; font-weight: bold;")
-        options_layout.addWidget(self.proxify_locals)
-
-        # Vanta
-        self.vmify = QCheckBox("Vanta — LZW + XOR-OP + Opaque Predicates  [Vantablack III]")
-        self.vmify.setChecked(False)
-        self.vmify.setToolTip(
-            "Wraps the script with Vantablack III: LZW-compressed opcode shuffle, "
-            "XOR key obfuscation, randomised opaque predicate guard, and a poison "
-            "fallback branch. Applied last — overrides wrap_function."
-        )
-        self.vmify.setStyleSheet("color: #CC0000; font-weight: bold;")
-        options_layout.addWidget(self.vmify)
-        
-        layout.addWidget(options_group)
-        
-        layout.addSpacing(10)
-        
-        # Warning
-        warning = QLabel("Heavily obfuscated code may run slower and be harder to debug. "
-                         "Vanta is the strongest option — LZW + XOR-OP shuffle + opaque predicates.")
-        warning.setStyleSheet("color: #FF8800; font-size: 9pt;")
-        warning.setWordWrap(True)
-        layout.addWidget(warning)
-        
-        # Buttons
-        btn_layout = QHBoxLayout()
-        
-        self.btn_obfuscate = QPushButton("Obfuscate")
-        self.btn_obfuscate.setStyleSheet("""
-            QPushButton {
-                background-color: #E81123;
-                color: white;
-                font-weight: bold;
-                padding: 8px 20px;
-                border-radius: 4px;
-            }
-            QPushButton:hover {
-                background-color: #C50F1F;
-            }
-        """)
-        
-        btn_cancel = QPushButton("Cancel")
-        
-        btn_layout.addStretch()
-        btn_layout.addWidget(btn_cancel)
-        btn_layout.addWidget(self.btn_obfuscate)
-        
-        layout.addLayout(btn_layout)
-        
-        self.setLayout(layout)
-        
-        # Connect buttons
-        btn_cancel.clicked.connect(self.reject)
-        self.btn_obfuscate.clicked.connect(self.accept)
-        
-        # Apply default preset
-        self.apply_preset("Medium")
-    
-    def apply_preset(self, preset):
-        """Apply a preset configuration."""
-        # Reset new options first
-        self.proxify_locals.setChecked(False)
-        self.vmify.setChecked(False)
-
-        if preset == "Light":
-            self.rename_vars.setChecked(True)
-            self.encode_strings.setChecked(False)
-            self.encode_numbers.setChecked(False)
-            self.control_flow.setChecked(False)
-            self.add_junk.setChecked(False)
-            self.minify.setChecked(True)
-            self.anti_debug.setChecked(False)
-            self.wrap_function.setChecked(True)
-        elif preset == "Medium":
-            self.rename_vars.setChecked(True)
-            self.encode_strings.setChecked(True)
-            self.encode_numbers.setChecked(False)
-            self.control_flow.setChecked(True)
-            self.add_junk.setChecked(False)
-            self.minify.setChecked(True)
-            self.anti_debug.setChecked(False)
-            self.wrap_function.setChecked(True)
-        elif preset == "Heavy":
-            self.rename_vars.setChecked(True)
-            self.encode_strings.setChecked(True)
-            self.encode_numbers.setChecked(True)
-            self.control_flow.setChecked(True)
-            self.add_junk.setChecked(True)
-            self.minify.setChecked(True)
-            self.anti_debug.setChecked(True)
-            self.wrap_function.setChecked(True)
-            self.proxify_locals.setChecked(True)
-        elif preset == "Maximum":
-            self.rename_vars.setChecked(True)
-            self.encode_strings.setChecked(True)
-            self.encode_numbers.setChecked(True)
-            self.control_flow.setChecked(True)
-            self.add_junk.setChecked(True)
-            self.minify.setChecked(True)
-            self.anti_debug.setChecked(True)
-            self.wrap_function.setChecked(True)
-            self.proxify_locals.setChecked(True)
-            self.vmify.setChecked(True)
-        # Custom doesn't change anything
-    
-    def get_options(self):
-        """Return the selected options as a dictionary."""
-        return {
-            'rename_vars': self.rename_vars.isChecked(),
-            'encode_strings': self.encode_strings.isChecked(),
-            'encode_numbers': self.encode_numbers.isChecked(),
-            'control_flow': self.control_flow.isChecked(),
-            'add_junk': self.add_junk.isChecked(),
-            'minify': self.minify.isChecked(),
-            'anti_debug': self.anti_debug.isChecked(),
-            'wrap_function': self.wrap_function.isChecked(),
-            'proxify_locals': self.proxify_locals.isChecked(),
-            'vmify': self.vmify.isChecked(),
-        }
-
-
-class LuaObfuscator:
-    def __init__(self, options):
-        self.options = options
-        self.var_map = {}
-        self.var_counter = 0
-        self.keywords = {'and', 'break', 'do', 'else', 'elseif', 'end', 'false', 'for', 'function', 
-                         'if', 'in', 'local', 'nil', 'not', 'or', 'repeat', 'return', 'then', 
-                         'true', 'until', 'while', 'goto'}
-        self.roblox_globals = {'game', 'workspace', 'script', 'Instance', 'Vector3', 'CFrame', 
-                               'task', 'wait', 'spawn', 'print', 'warn', 'error', 'shared', 
-                               '_G', 'getgenv', 'getrenv', 'Enum', 'Color3', 'UDim2', 'math', 
-                               'string', 'table', 'pcall', 'xpcall', 'delay', 'tick', 'os'}
-    def tokenize(self, code):
-        """
-        Breaks Lua code into safe tokens.
-        Ensures we never obfuscate strings, comments, or keywords.
-        """
-        token_specification = [
-            ('COMMENT_MULTI', r'--\[\[.*?\]\]'),          # Multi-line comment
-            ('COMMENT_SINGLE', r'--.*'),                   # Single-line comment
-            ('STRING', r'["\']([^"\\]|\\.)*["\']'),        # String literals
-            ('NUMBER', r'\b\d+\.?\d*\b'),                  # Numbers
-            ('IDENTIFIER', r'[a-zA-Z_][a-zA-Z0-9_]*'),     # Variables/Functions
-            ('OPERATOR', r'[+\-*/%^#=<>~.|:,;{}()\[\]]'),  # Operators/Brackets
-            ('WHITESPACE', r'\s+'),                        # Space/Tabs/Newlines
-            ('MISMATCH', r'.'),                            # Anything else
-        ]
-        tok_regex = '|'.join('(?P<%s>%s)' % pair for pair in token_specification)
-        tokens = []
-        for mo in re.finditer(tok_regex, code, re.DOTALL):
-            kind = mo.lastgroup
-            value = mo.group()
-            tokens.append({'type': kind, 'value': value})
-        return tokens
-
-    def obfuscate(self, code):
-        result = code
-
-        # Step 1: Rename variables
-        if self.options['rename_vars']:
-            result = self.rename_variables(result)
-
-        # Step 2: ProxifyLocals
-        if self.options.get('proxify_locals'):
-            result = LuaProxifyLocals().proxify(result)
-
-        # Step 3: Encode strings
-        if self.options['encode_strings']:
-            result = self.encode_strings(result)
-
-        # Step 4: Encode numbers
-        if self.options['encode_numbers']:
-            result = self.encode_numbers(result)
-
-        # Step 5: Control flow
-        if self.options['control_flow']:
-            result = self.add_control_flow(result)
-
-        # Step 6: Junk code
-        if self.options['add_junk']:
-            result = self.add_junk_code(result)
-
-        # Step 7: Anti-debug
-        if self.options['anti_debug']:
-            result = self.add_anti_debug(result)
-
-        # Step 8: Wrap in function (skipped if vmify)
-        if self.options['wrap_function'] and not self.options.get('vmify'):
-            result = self.wrap_in_function(result)
-
-        # Step 9: Minify
-        if self.options['minify']:
-            result = self.minify_code(result)
-
-        # Step 10: Vanta last
-        if self.options.get('vmify'):
-            result = LuaVantaObfuscator().obfuscate(result)
-
-        return result
-
-    def generate_var_name_mangled(self, var_id):
-        digits = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_'
-        start_digits = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'
-        name = ''
-        d = var_id % len(start_digits)
-        var_id = (var_id - d) // len(start_digits)
-        name = name + start_digits[d]
-        while var_id > 0:
-            d = var_id % len(digits)
-            var_id = (var_id - d) // len(digits)
-            name = name + digits[d]
-        return name
-
-    def generate_var_name(self):
-        name = self.generate_var_name_mangled(self.var_counter)
-        self.var_counter += 1
-        return name
-
-    def rename_variables(self, code):
-        lines = code.split('\n')
-        for line in lines:
-            if 'local ' in line and not line.strip().startswith('--'):
-                match = re.search(r'local\s+([a-zA-Z_][a-zA-Z0-9_]*)', line)
-                if match:
-                    old_name = match.group(1)
-                    if old_name not in self.var_map:
-                        self.var_map[old_name] = self.generate_var_name()
-
-        result = '\n'.join(lines)
-        for old_name, new_name in self.var_map.items():
-            result = re.sub(r'\b' + re.escape(old_name) + r'\b', new_name, result)
-        return result
-
-    def encode_strings(self, code):
-        """Encode strings as string.char() calls — safe for executors."""
-        result = []
-        i = 0
-        n = len(code)
-        while i < n:
-            # Skip single-line comments
-            if code[i:i+2] == '--' and code[i:i+4] != '--[[':
-                end = code.find('\n', i)
-                if end == -1:
-                    result.append(code[i:])
-                    break
-                result.append(code[i:end])
-                i = end
-                continue
-
-            # Skip multi-line comments
-            if code[i:i+4] == '--[[':
-                end = code.find(']]', i+4)
-                if end == -1:
-                    result.append(code[i:])
-                    break
-                result.append(code[i:end+2])
-                i = end + 2
-                continue
-
-            # Handle strings
-            if code[i] in ('"', "'"):
-                quote = code[i]
-                j = i + 1
-                content = []
-                while j < n:
-                    if code[j] == '\\' and j + 1 < n:
-                        # Keep escape sequences as-is by getting actual char
-                        esc = code[j:j+2]
-                        # Just collect the raw char after escape
-                        content.append(code[j+1])
-                        j += 2
-                        continue
-                    if code[j] == quote:
-                        j += 1
-                        break
-                    content.append(code[j])
-                    j += 1
-                # Build string.char() expression
-                escaped = ''.join('\\' + str(ord(c)).zfill(3) for c in ''.join(content))
-                result.append(f'"{escaped}"')
-                i = j
-                continue
-
-            result.append(code[i])
-            i += 1
-
-        return ''.join(result)
-
-    def encode_numbers(self, code):
-        """Only encode standalone integer literals, not inside strings or decimals."""
-        def replace_number(match):
-            num_str = match.group(0)
-            num = int(num_str)
-            if num > 10:
-                a = random.randint(1, num - 1)
-                b = num - a
-                return f'({a}+{b})'
-            return num_str
-
-        # Only match integers not preceded/followed by . (avoid floats/decimals)
-        return re.sub(r'(?<![.\w])\b([1-9][0-9]+)\b(?!\s*\.)', replace_number, code)
-
-    def add_control_flow(self, code):
-        """Insert junk control flow only at safe points (end of complete lines)."""
-        junk = [
-            'do local _=nil end',
-            'if false then end',
-            'while false do break end',
-        ]
-        lines = code.split('\n')
-        result = []
-        for i, line in enumerate(lines):
-            result.append(line)
-            stripped = line.strip()
-            # Only insert after lines that are clearly complete statements
-            if (i % 8 == 0 and stripped and
-                not stripped.startswith('--') and
-                not stripped.endswith(',') and
-                not stripped.endswith('(') and
-                not stripped.endswith('{') and
-                not stripped.endswith('and') and
-                not stripped.endswith('or') and
-                not stripped.endswith('=') and
-                not stripped.endswith('..') and
-                stripped not in ('', 'do', 'then', 'else', 'repeat')):
-                result.append(random.choice(junk))
-        return '\n'.join(result)
-
-    def add_junk_code(self, code):
-        """Insert junk locals only at safe points."""
-        junk = [
-            'local _junk0=nil',
-            'local _junk1=0',
-            'local _junk2=false',
-        ]
-        lines = code.split('\n')
-        result = []
-        for i, line in enumerate(lines):
-            result.append(line)
-            stripped = line.strip()
-            if (i % 12 == 0 and stripped and
-                not stripped.startswith('--') and
-                not stripped.endswith(',') and
-                not stripped.endswith('(') and
-                not stripped.endswith('{') and
-                not stripped.endswith('and') and
-                not stripped.endswith('or') and
-                not stripped.endswith('=') and
-                not stripped.endswith('..') and
-                stripped not in ('', 'do', 'then', 'else', 'repeat')):
-                result.append(random.choice(junk))
-        return '\n'.join(result)
-
-    def add_anti_debug(self, code):
-        anti_debug = 'if not game or not game:GetService("Players") then return end\n'
-        return anti_debug + code
-
-    def wrap_in_function(self, code):
-        return f'return(function(...)\n{code}\nend)(...)'
-
-    def minify_code(self, code):
-        # Remove single-line comments
-        code = re.sub(r'--(?!\[\[)[^\n]*', '', code)
-        # Remove multi-line comments
-        code = re.sub(r'--\[\[.*?\]\]', '', code, flags=re.DOTALL)
-        # Strip lines and remove blanks
-        lines = [line.strip() for line in code.split('\n') if line.strip()]
-        # Join with newlines (safer than spaces — avoids keyword merging)
-        return '\n'.join(lines)
-
-# --- ProxifyLocals Obfuscation ---
-class LuaProxifyLocals:
-    """
-    Inspired by Prometheus's ProxifyLocals step.
-    Wraps local variable declarations in metatable proxy objects so that
-    every read/write goes through __index / __newindex metamethods,
-    hiding the real value from static analysis.
-    """
-
-    # Metatable metamethod pairs we can use for set/get
-    META_OPS = [
-        ("__add",    "__sub"),
-        ("__sub",    "__add"),
-        ("__mul",    "__div"),
-        ("__div",    "__mul"),
-        ("__mod",    "__pow"),
-        ("__pow",    "__mod"),
-        ("__concat", "__len"),
-    ]
-
-    def __init__(self):
-        import random
-        self._rng = random
-        self._counter = 0
-
-    def _uid(self):
-        self._counter += 1
-        chars = 'lI1O0_'
-        out = ''
-        n = self._counter
-        for _ in range(8):
-            out += chars[n % len(chars)]
-            n //= len(chars)
-        return '_' + out
-
-    def _random_key(self):
-        """Generate a random string key for the hidden value slot."""
-        import random
-        letters = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'
-        return ''.join(random.choice(letters) for _ in range(self._rng.randint(6, 12)))
-
-    def _make_proxy(self, val_expr: str, set_meta: str, get_meta: str, key: str) -> str:
-        """
-        Emit Lua code for:
-            setmetatable({[key]=val_expr}, {
-                [set_meta] = function(t,v) t[key]=v end,
-                [get_meta] = function(t,x) return rawget(t,key) end,
-            })
-        Returns a Lua expression string.
-        """
-        return (
-            f'setmetatable({{{key}={val_expr}}},{{'
-            f'{set_meta}=function(_t,_v) _t["{key}"]=_v end,'
-            f'{get_meta}=function(_t,_x) return rawget(_t,"{key}") end'
-            f'}})'
-        )
-
-    def proxify(self, code: str) -> str:
-        """
-        Scan for   local <name> = <expr>   patterns and replace each one with
-        a proxy-wrapped version.  Then replace all subsequent bare uses of
-        <name> with the appropriate getter expression.
-
-        Limitations (text-based, no real AST):
-        - Only handles simple single-assignment   local x = ...   forms.
-        - Skips function declarations (local function ...) and for-loop vars.
-        - Won't proxy function arguments or loop variables.
-        """
-        import random
-
-        lines = code.split('\n')
-        # Map: varname -> (proxy_varname, get_meta, key)
-        var_info: dict = {}
-
-        result_lines = []
-        for line in lines:
-            stripped = line.lstrip()
-
-            # Skip comments
-            if stripped.startswith('--'):
-                result_lines.append(line)
-                continue
-
-            # Skip local function declarations
-            if re.match(r'local\s+function\s+', stripped):
-                result_lines.append(line)
-                continue
-
-            # Match:  local <name> = <expr>   (single var, simple assignment)
-            m = re.match(r'^(\s*)local\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+)$', line)
-            if m:
-                indent, varname, expr = m.group(1), m.group(2), m.group(3)
-
-                # Pick random metamethod pair
-                set_meta, get_meta = random.choice(self.META_OPS)
-                key = self._random_key()
-                proxy_name = self._uid()
-
-                var_info[varname] = (proxy_name, get_meta, key)
-
-                proxy_expr = self._make_proxy(expr.rstrip(), set_meta, get_meta, key)
-                result_lines.append(f'{indent}local {proxy_name} = {proxy_expr}')
-                continue
-
-            # For all other lines: replace known variable names with getter calls
-            new_line = line
-            for varname, (proxy_name, get_meta, key) in var_info.items():
-                # Replace bare usage: varname  ->  proxy_name[key]
-                # Use word-boundary to avoid partial matches
-                # Avoid replacing if it appears after 'local ' (re-declaration)
-                new_line = re.sub(
-                    r'(?<!\w)' + re.escape(varname) + r'(?!\w)',
-                    f'{proxy_name}["{key}"]',
-                    new_line
-                )
-            result_lines.append(new_line)
-
-        return '\n'.join(result_lines)
-
-
-# --- Vantablack Obfuscator (LZW + XOR-OP shuffle + Opaque Predicates) ---
-class LuaVantaObfuscator:
-    """
-    Full-chain port of VantaObfuscator.lua.
-    Pipeline: LZW compress -> XOR opcode shuffle -> opaque predicate guard -> poison fallback.
-    """
-
-    OP_COUNT = 15
-    OP = {
-        'LOADNIL':0,'LOADBOOL':1,'LOADINT':2,'LOADSTR':3,'MOVE':4,
-        'GETGLOBAL':5,'SETGLOBAL':6,'GETTABLE':7,'SETTABLE':8,
-        'ADD':9,'SUB':10,'CALL':11,'JMP':12,'RETURN':13,'EXIT':14
-    }
-
-    # ── LZW compress → packed base-36 length-prefixed tokens ────────────────
-    @staticmethod
-    def _lzw_compress(inp: str) -> str:
-        d = {chr(i): i for i in range(256)}
-        ds, w, out = 256, "", []
-
-        def enc(n: int) -> str:
-            if n == 0:
-                return "0"
-            s = ""
-            while n > 0:
-                s = "0123456789abcdefghijklmnopqrstuvwxyz"[n % 36] + s
-                n //= 36
-            return s
-
-        for c in inp:
-            wc = w + c
-            if wc in d:
-                w = wc
-            else:
-                e = enc(d[w])
-                out.append(format(len(e), 'x') + e)
-                d[wc] = ds
-                ds += 1
-                w = c
-        if w:
-            e = enc(d[w])
-            out.append(format(len(e), 'x') + e)
-        return "".join(out)
-
-    # ── Serialize a tiny stub ISA to binary string ───────────────────────────
-    @staticmethod
-    def _serialize_vbin(enc_map: dict, xor_key: int) -> str:
-        instrs = [
-            [LuaVantaObfuscator.OP['GETGLOBAL'],  1, 0],
-            [LuaVantaObfuscator.OP['LOADSTR'],     2, 0],
-            [LuaVantaObfuscator.OP['CALL'],        1, 0],
-            [LuaVantaObfuscator.OP['EXIT'],        0, 0],
-        ]
-        buf = [chr(len(instrs))]
-        for ins in instrs:
-            op  = enc_map.get(ins[0], ins[0])
-            buf.append(chr((op     ^ xor_key) & 0xFF))
-            buf.append(chr((ins[1] ^ xor_key) & 0xFF))
-            buf.append(chr((ins[2] ^ xor_key) & 0xFF))
-        return "".join(buf)
-
-    # ── Pick a random opaque predicate ──────────────────────────────────────
-    @staticmethod
-    def _opaque_predicate() -> str:
-        choice = random.randint(0, 3)
-        if choice == 0:
-            a = random.randint(1, 999)
-            return f"((tick and tick() or 0) * 0 + {a}) == {a}"
-        elif choice == 1:
-            a = random.randint(1, 500)
-            return f"(function(...) return select('#', ...) >= 0 end)({a})"
-        elif choice == 2:
-            return "(function() local ok = pcall(function() end); return ok end)()"
-        else:
-            n = random.randint(1, 65535)
-            return f"rawequal({n}, {n})"
-
-    # ── Poison branch (never reached) ───────────────────────────────────────
-    @staticmethod
-    def _poison() -> str:
-        return random.choice([
-            "while true do end",
-            "local x={}; while true do x[#x+1]=0 end",
-            "os.exit()",
-        ])
-
-    # ── Build the full Lua stub ──────────────────────────────────────────────
-    def obfuscate(self, code: str) -> str:
-        xor_key = random.randint(1, 255)
-
-        # Shuffle opcode pool
-        pool = list(range(self.OP_COUNT))
-        for i in range(self.OP_COUNT - 1, 0, -1):
-            j = random.randint(0, i)
-            pool[i], pool[j] = pool[j], pool[i]
-        enc_map = {c: pool[c] for c in range(self.OP_COUNT)}
-        dec_map = {v: k for k, v in enc_map.items()}
-
-        vbin    = self._serialize_vbin(enc_map, xor_key)
-        lzw_str = self._lzw_compress(vbin)
-
-        # Dec-map literal
-        dm_lit  = "{" + ",".join(f"[{w}]={c}" for w, c in dec_map.items()) + "}"
-
-        predicate = self._opaque_predicate()
-        poison    = self._poison()
-
-        op_GG   = self.OP['GETGLOBAL']
-        op_LS   = self.OP['LOADSTR']
-        op_CA   = self.OP['CALL']
-        op_EX   = self.OP['EXIT']
-
-        stub = f"""local _D,_K,_B={dm_lit},{xor_key},"{lzw_str}"
-local function _L(b)
-local g,f,i,e={{}},256,1,{{}}
-for h=0,255 do g[h]=string.char(h) end
-local function k()
-local l=tonumber(b:sub(i,i),16);i=i+1
-local m=tonumber(b:sub(i,i+l-1),36);i=i+l;return m
-end
-local c=string.char(k());e[1]=c
-while i<=#b do
-local n=k();local d=g[n] or (c..c:sub(1,1))
-g[f]=c..d:sub(1,1);e[#e+1],c,f=d,d,f+1
-end
-return table.concat(e)
-end
-local function _V()
-local b=_L(_B)
-local p,Stk,PC=1,{{}},1
-local function rb() local v=b:byte(p)~_K;p=p+1;return v end
-local nI=rb()
-local Insts={{}}
-for i=1,nI do Insts[i]={{rb(),rb(),rb()}} end
-local Ops={{
-[{op_GG}]=function(a,b) Stk[a]=getfenv()["print"] end,
-[{op_LS}]=function(a,b) Stk[a]="Vantablack Active" end,
-[{op_CA}]=function(a,b) Stk[a](Stk[a+1]) end,
-[{op_EX}]=function() PC=9e9 end
-}}
-while PC<=#Insts do
-local i=Insts[PC]
-local op=_D[i[1]] or i[1]
-if Ops[op] then Ops[op](i[2],i[3]) end
-PC=PC+1
-end
-end
--- [[ Vantablack III ]]
-do
-local _src=[[
-{code}
-]]
-local _fn,_err=(loadstring or load)(_src)
-if not _fn then error("[Vanta] "..(tostring(_err) or "?")) end
-if {predicate} then _V();_fn() else {poison} end
-end"""
-        return stub
-
-
-class LuaLocalizer:
-    @staticmethod
-    def localize(code):
-        services = set(re.findall(r'game:GetService\(["\'](\w+)["\']\)', code))
-        globals_to_fix = ["Vector3", "CFrame", "Instance", "UDim2", "Color3", "task", "wait", "spawn"]
-        
-        found_globals = [g for g in globals_to_fix if re.search(r'\b' + g + r'\b', code)]
-        
-        header = "-- [[ Callum's Auto-Localization ]]\n"
-        for service in services:
-            header += f'local {service} = game:GetService("{service}")\n'
-        for g in found_globals:
-            header += f'local {g} = {g}\n'
-        
-        # Replace game:GetService calls with direct service variable
-        for service in services:
-            code = code.replace(f'game:GetService("{service}")', service)
-            code = code.replace(f"game:GetService('{service}')", service)
-            
-        return header + "\n" + code
-
-# ── Monaco Editor Widget ───────────────────────────────────────────────────────
 class MonacoEditor(QWebEngineView):
     """
     QWebEngineView wrapper that hosts Monaco.html.
@@ -1886,6 +1123,91 @@ class _FakeCursor:
 
 
 # --- Main Application Window ---
+class _BridgeSettingsDialog(QDialog):
+    def __init__(self, parent=None, pipe="", auto_push=False, ext_path=""):
+        super().__init__(parent)
+        self.setWindowTitle("DLL Bridge Settings")
+        self.setMinimumWidth(500)
+        lay = QVBoxLayout(self)
+        lay.setSpacing(10)
+
+        lay.addWidget(QLabel("<b>Pipe / Socket Path</b>"))
+        pr = QHBoxLayout()
+        self._pipe = QLineEdit(pipe)
+        self._pipe.setPlaceholderText("\\\\.\\pipe\\LuaBoxBridge  or  /tmp/luabox.sock")
+        pr.addWidget(self._pipe)
+        bt = QPushButton("Test")
+        bt.setFixedWidth(52)
+        bt.clicked.connect(self._test)
+        pr.addWidget(bt)
+        lay.addLayout(pr)
+        self._status = QLabel("")
+        self._status.setStyleSheet("font-size:9pt;")
+        lay.addWidget(self._status)
+
+        _sep = lambda: (lambda w: (w.setFixedHeight(1), w.setStyleSheet("background:#555;"), w))(QWidget())[2]
+        lay.addWidget(_sep())
+
+        self._auto = QCheckBox("Auto-push to executor on every Save (Ctrl+S)")
+        self._auto.setChecked(auto_push)
+        lay.addWidget(self._auto)
+
+        lay.addWidget(_sep())
+        lay.addWidget(QLabel("<b>External Edit -- Watch File</b>"))
+        _nl = QLabel("Watch a .lua file on disk. Any time it is saved by an external editor, LuaBox auto-pushes it to the executor.")
+        _nl.setWordWrap(True)
+        lay.addWidget(_nl)
+
+        er = QHBoxLayout()
+        self._ext = QLineEdit(ext_path)
+        self._ext.setPlaceholderText("Path to .lua file to watch...")
+        er.addWidget(self._ext)
+        bb = QPushButton("Browse...")
+        bb.setFixedWidth(70)
+        bb.clicked.connect(self._browse)
+        er.addWidget(bb)
+        lay.addLayout(er)
+
+        lay.addWidget(_sep())
+        note = QLabel("<b>DLL protocol:</b> open the pipe name above, read 4-byte LE uint32 = script length, then read that many UTF-8 bytes. Pass the string to your internal execute function.")
+        note.setWordWrap(True)
+        note.setTextFormat(Qt.TextFormat.RichText)
+        lay.addWidget(note)
+
+        br = QHBoxLayout()
+        ok_btn = QPushButton("Save"); ok_btn.clicked.connect(self.accept)
+        cn_btn = QPushButton("Cancel"); cn_btn.clicked.connect(self.reject)
+        br.addStretch(); br.addWidget(ok_btn); br.addWidget(cn_btn)
+        lay.addLayout(br)
+
+    def _test(self):
+        pipe = self._pipe.text().strip()
+        try:
+            data = struct.pack("<I", 0)
+            if sys.platform == "win32":
+                import ctypes, ctypes.wintypes as wt
+                h = ctypes.windll.kernel32.CreateFileW(pipe, 0x40000000, 0, None, 3, 0, None)
+                if h == wt.HANDLE(-1).value: raise OSError("Pipe not found")
+                ctypes.windll.kernel32.CloseHandle(h)
+            else:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                    s.settimeout(1.5); s.connect(pipe)
+            self._status.setText("✓  Connected")
+            self._status.setStyleSheet("color:#3fb950;font-size:9pt;")
+        except Exception as e:
+            self._status.setText(f"✗  {e}")
+            self._status.setStyleSheet("color:#f85149;font-size:9pt;")
+
+    def _browse(self):
+        p, _ = QFileDialog.getOpenFileName(self, "Watch file", "", "Lua Files (*.lua *.luau);;All Files (*)")
+        if p: self._ext.setText(p)
+
+    def get_config(self):
+        return {"pipe": self._pipe.text().strip(),
+                "auto_push": self._auto.isChecked(),
+                "ext_path": self._ext.text().strip()}
+
+
 class LuaIDE(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1902,6 +1224,13 @@ class LuaIDE(QMainWindow):
         
         # Find & Replace dialog
         self.find_replace_dialog = None
+
+        # Bridge state
+        self._bridge_pipe      = "\\\\.\\pipe\\LuaBoxBridge" if sys.platform == "win32" else "/tmp/luabox.sock"
+        self._bridge_auto_push = False
+        self._bridge_ext_path  = ""
+        self._bridge_watcher   = QFileSystemWatcher(self)
+        self._bridge_watcher.fileChanged.connect(self._bridge_ext_changed)
 
         # Theme state
         self._current_theme = "Light"
@@ -1951,6 +1280,7 @@ class LuaIDE(QMainWindow):
         self._btn_format.setToolTip("Format / Beautify Lua code  (Ctrl+Shift+F)")
         from PyQt6.QtGui import QShortcut, QKeySequence
         QShortcut(QKeySequence("Ctrl+Shift+F"), self).activated.connect(self.format_current_code)
+        QShortcut(QKeySequence("Ctrl+Return"), self).activated.connect(self._bridge_push)
 
         btn_strip = QPushButton("Remove Comments")
         btn_strip.clicked.connect(self.remove_comments)
@@ -1958,8 +1288,6 @@ class LuaIDE(QMainWindow):
         btn_find_replace = QPushButton("Find & Replace")
         btn_find_replace.clicked.connect(self.show_find_replace)
 
-        self._btn_obfuscate = QPushButton("Obfuscate")
-        self._btn_obfuscate.clicked.connect(self.show_obfuscator)
         
         # Recent files dropdown button
         self.btn_recent = QPushButton("Recent Files ▼")
@@ -1971,12 +1299,24 @@ class LuaIDE(QMainWindow):
         toolbar_layout.addWidget(self.btn_recent)
         toolbar_layout.addWidget(create_separator())
         toolbar_layout.addWidget(btn_find_replace)
-        toolbar_layout.addWidget(self._btn_obfuscate)
         toolbar_layout.addWidget(create_separator())
         toolbar_layout.addWidget(self._btn_settings)
         toolbar_layout.addWidget(create_separator())
         toolbar_layout.addWidget(btn_strip)
         toolbar_layout.addWidget(self._btn_format)
+        toolbar_layout.addWidget(create_separator())
+        self._btn_bridge_push = QPushButton("\u25b6  Push Script")
+        self._btn_bridge_push.setToolTip("Send current script to executor via pipe/socket  (Ctrl+Return)")
+        self._btn_bridge_push.clicked.connect(self._bridge_push)
+        toolbar_layout.addWidget(self._btn_bridge_push)
+        self._btn_bridge_cfg = QPushButton("\u2699  Bridge")
+        self._btn_bridge_cfg.setToolTip("Configure DLL bridge / external edit settings")
+        self._btn_bridge_cfg.clicked.connect(self._bridge_show_settings)
+        toolbar_layout.addWidget(self._btn_bridge_cfg)
+        self._lbl_bridge_status = QLabel("\u25cf")
+        self._lbl_bridge_status.setToolTip("Bridge: not connected")
+        self._lbl_bridge_status.setStyleSheet("color: #888; font-size: 10pt;")
+        toolbar_layout.addWidget(self._lbl_bridge_status)
         toolbar_layout.addStretch()
 
         main_layout.addWidget(self._toolbar_widget)
@@ -2074,7 +1414,73 @@ class LuaIDE(QMainWindow):
         content_splitter.addWidget(editor_widget)
         content_splitter.setSizes([200, 1000])
 
-        main_layout.addWidget(content_splitter)
+        self._vert_splitter = QSplitter(Qt.Orientation.Vertical)
+        self._vert_splitter.setChildrenCollapsible(False)
+        self._vert_splitter.addWidget(content_splitter)
+
+        # Terminal dock
+        term_container = QWidget()
+        term_layout = QVBoxLayout(term_container)
+        term_layout.setContentsMargins(0, 0, 0, 0)
+        term_layout.setSpacing(0)
+
+        term_header = QWidget()
+        term_header.setFixedHeight(28)
+        th_layout = QHBoxLayout(term_header)
+        th_layout.setContentsMargins(6, 0, 6, 0)
+        th_layout.setSpacing(6)
+        self._term_title_lbl = QLabel("  TERMINAL")
+        self._term_title_lbl.setStyleSheet("font-weight:bold;font-size:9pt;letter-spacing:1px;")
+        th_layout.addWidget(self._term_title_lbl)
+        th_layout.addStretch()
+        self._term_cwd_label = QLabel("")
+        self._term_cwd_label.setStyleSheet("font-size:8pt;")
+        th_layout.addWidget(self._term_cwd_label)
+        btn_term_clear = QPushButton("Clear")
+        btn_term_clear.setFixedSize(48, 20)
+        btn_term_clear.clicked.connect(self._term_clear)
+        th_layout.addWidget(btn_term_clear)
+        btn_term_kill = QPushButton("Kill")
+        btn_term_kill.setFixedSize(38, 20)
+        btn_term_kill.clicked.connect(self._term_kill)
+        th_layout.addWidget(btn_term_kill)
+        term_layout.addWidget(term_header)
+
+        from PyQt6.QtGui import QFont as _QFont
+        self._term_output = QPlainTextEdit()
+        self._term_output.setReadOnly(True)
+        self._term_output.setMaximumBlockCount(2000)
+        self._term_output.setFont(_QFont("Consolas", 10))
+        term_layout.addWidget(self._term_output)
+
+        input_row = QWidget()
+        in_layout = QHBoxLayout(input_row)
+        in_layout.setContentsMargins(4, 2, 4, 2)
+        in_layout.setSpacing(4)
+        self._term_prompt = QLabel("$")
+        self._term_prompt.setFixedWidth(14)
+        self._term_prompt.setStyleSheet("font-family:Consolas;font-size:10pt;font-weight:bold;")
+        in_layout.addWidget(self._term_prompt)
+        self._term_input = QLineEdit()
+        self._term_input.setFont(_QFont("Consolas", 10))
+        self._term_input.setPlaceholderText("Enter command...")
+        self._term_input.returnPressed.connect(self._term_run)
+        in_layout.addWidget(self._term_input)
+        btn_run = QPushButton("Run")
+        btn_run.setFixedWidth(42)
+        btn_run.clicked.connect(self._term_run)
+        in_layout.addWidget(btn_run)
+        term_layout.addWidget(input_row)
+
+        self._vert_splitter.addWidget(term_container)
+        self._vert_splitter.setSizes([700, 200])
+
+        self._term_process  = None
+        self._term_history  = []
+        self._term_hist_idx = -1
+        self._term_input.installEventFilter(self)
+
+        main_layout.addWidget(self._vert_splitter)
 
         # Populate file explorer
         self.refresh_explorer()
@@ -2145,6 +1551,8 @@ class LuaIDE(QMainWindow):
             self.tab_widget.setTabText(current_index, os.path.basename(filename))
             self.add_recent_file(filename)
             QMessageBox.information(self, "Success", "File saved successfully!")
+            if self._bridge_auto_push:
+                self._bridge_push(silent=True)
 
     def close_tab(self, index):
         """Close a tab."""
@@ -2511,7 +1919,8 @@ class LuaIDE(QMainWindow):
         # 4. Accent buttons
         self._btn_settings.setStyleSheet(f"background-color: {t['btn_settings']};")
         self._btn_format.setStyleSheet(f"background-color: {t['btn_format']};")
-        self._btn_obfuscate.setStyleSheet(f"background-color: {t['btn_obfuscate']};")
+        self._btn_bridge_push.setStyleSheet(f"background-color: {t['btn_bridge']};")
+        self._btn_bridge_cfg.setStyleSheet(f"background-color: {t['btn_bridge']};")
 
         # 5. Explorer header
         self._explorer_header.setStyleSheet(
@@ -2596,8 +2005,7 @@ if not checkIntegrity() then
     error("[Security] Integrity check failed -- aborting", 2)
 end
 ''',
-            'Anti-Debug / Decompiler Traps': '''-- Detects decompiler or debug injection
-local function isDecompilerPresent()
+            'Anti-Debug / Decompiler Traps': '''local function isDecompilerPresent()
     local info = debug and debug.getinfo and debug.getinfo(1, "u")
     if info and info.nups and info.nups > 32 then return true end
     for _, k in ipairs({"dumpfunction","decompile","getscriptbytecode"}) do
@@ -2605,13 +2013,12 @@ local function isDecompilerPresent()
     end
     return false
 end
-if isDecompilerPresent() then return end  -- silent exit
+if isDecompilerPresent() then return end
 local _s = {}
 local function _c() return _s end
 assert(_c() == _s, "[Security] Closure integrity violated")
 ''',
-            'Anti-WebSocket Detection': '''-- Detects __namecall hooks from remote spies / WS loggers
-local mt = getrawmetatable(game)
+            'Anti-WebSocket Detection': '''local mt = getrawmetatable(game)
 local origNC = rawget(mt, "__namecall")
 if origNC and iscclosure and not iscclosure(origNC) then
     warn("[Security] __namecall hook detected -- possible remote spy")
@@ -2626,8 +2033,7 @@ local function watchRemote(remote)
 end
 -- watchRemote(game.ReplicatedStorage:WaitForChild("SomeRemote"))
 ''',
-            'WebSocket Block Header': '''-- Blocks raw WS connections and non-whitelisted HTTP exfil
-local _bWS = setmetatable({}, {
+            'WebSocket Block Header': '''local _bWS = setmetatable({}, {
     __index    = function(_, k) warn("[Security] WebSocket."..k.." blocked"); return function() end end,
     __newindex = function() end,
     __call     = function() warn("[Security] WebSocket() blocked"); return nil end,
@@ -2645,6 +2051,39 @@ local function safeRequest(opts)
 end
 http_request = safeRequest; request = safeRequest
 ''',
+            'identifyexecutor Spoof -- Generic': '''-- Spoofs identifyexecutor to return a chosen executor name
+local SPOOF_NAME = "Synapse X"
+local SPOOF_VER  = "2.1.0"
+local function spoofedIE() return SPOOF_NAME, SPOOF_VER end
+if rawget(_G,"identifyexecutor")~=nil then rawset(_G,"identifyexecutor",spoofedIE) end
+if rawget(_G,"getexecutorname")~=nil  then rawset(_G,"getexecutorname",spoofedIE)  end
+''',
+            'identifyexecutor Spoof -- Nil (hide executor)': '''-- Returns nil so scripts that gate on executor name get nothing
+local function hiddenIE() return nil, nil end
+if rawget(_G,"identifyexecutor")~=nil then rawset(_G,"identifyexecutor",hiddenIE) end
+if rawget(_G,"getexecutorname")~=nil  then rawset(_G,"getexecutorname",hiddenIE)  end
+''',
+            'identifyexecutor Spoof -- Dynamic Table': '''local SPOOF_AS = "Synapse X"
+local spoofTable = {
+    ["Synapse X"]  = {"Synapse X",  "2.1.0"},
+    ["KRNL"]       = {"KRNL",        "2.1.0"},
+    ["Fluxus"]     = {"Fluxus",      "1.0.0"},
+    ["Script-Ware"]= {"Script-Ware", "2.5.0"},
+    ["Electron"]   = {"Electron",    "1.0.0"},
+}
+local chosen = spoofTable[SPOOF_AS] or spoofTable["Synapse X"]
+local function spoofedIE() return chosen[1], chosen[2] end
+if rawget(_G,"identifyexecutor")~=nil then rawset(_G,"identifyexecutor",spoofedIE) end
+if rawget(_G,"getexecutorname")~=nil  then rawset(_G,"getexecutorname",spoofedIE)  end
+''',
+            'identifyexecutor Spoof -- genv Hook': '''-- Hooks via getgenv() -- visible script-wide, most reliable method
+local genv = getgenv()
+local SPOOF_NAME = "Synapse X"
+local SPOOF_VER  = "2.1.0"
+genv.identifyexecutor  = function() return SPOOF_NAME, SPOOF_VER end
+genv.getexecutorname   = function() return SPOOF_NAME, SPOOF_VER end
+genv.getexecutorversion= function() return SPOOF_VER end
+''',
             },
             "Loadstring Templates": {
             'Basic HttpGet Loadstring': '''loadstring(game:HttpGet("https://raw.githubusercontent.com/User/Repo/main/script.lua"))()
@@ -2659,46 +2098,37 @@ local ok, err = pcall(function()
 end)
 if not ok then warn("[Loader] Failed:", err) end
 ''',
-            'Loadstring with Version Check': '''local BASE      = "https://raw.githubusercontent.com/User/Repo/main/"
-local LOCAL_VER = "1.0.0"
-local ok, remoteVer = pcall(function()
-    return game:HttpGet(BASE.."version.txt"):match("^%S+")
-end)
-if ok and remoteVer and remoteVer ~= LOCAL_VER then
-    warn("[Loader] Update -- remote:", remoteVer, "local:", LOCAL_VER)
-end
-local ok2, err = pcall(function()
-    loadstring(game:HttpGet(BASE.."script.lua"))()
-end)
-if not ok2 then warn("[Loader] Error:", err) end
+            'Loadstring with Version Check': '''local BASE="https://raw.githubusercontent.com/User/Repo/main/"
+local LOCAL_VER="1.0.0"
+local ok,rv=pcall(function() return game:HttpGet(BASE.."version.txt"):match("^%S+") end)
+if ok and rv and rv~=LOCAL_VER then warn("[Loader] Update -- remote:",rv,"local:",LOCAL_VER) end
+local ok2,err=pcall(function() loadstring(game:HttpGet(BASE.."script.lua"))() end)
+if not ok2 then warn("[Loader] Error:",err) end
 ''',
-            'Multi-File Loader': '''local BASE  = "https://raw.githubusercontent.com/User/Repo/main/"
-local files = {"modules/utils.lua", "modules/ui.lua", "main.lua"}
+            'Multi-File Loader': '''local BASE="https://raw.githubusercontent.com/User/Repo/main/"
+local files={"modules/utils.lua","modules/ui.lua","main.lua"}
 local function loadRemote(path)
-    local src = game:HttpGet(BASE..path)
-    local fn, err = loadstring(src)
-    if not fn then warn("[Loader] Parse error:", path, err); return end
-    local ok, e = pcall(fn)
-    if not ok then warn("[Loader] Runtime error:", path, e) end
+    local src=game:HttpGet(BASE..path)
+    local fn,err=loadstring(src)
+    if not fn then warn("[Loader] Parse error:",path,err);return end
+    local ok,e=pcall(fn)
+    if not ok then warn("[Loader] Runtime error:",path,e) end
 end
-for _, f in ipairs(files) do loadRemote(f); task.wait() end
+for _,f in ipairs(files) do loadRemote(f);task.wait() end
 ''',
-            'Loadstring with Integrity Hash': '''-- Needs executor crypt or hashlib support
-local url      = "https://raw.githubusercontent.com/User/Repo/main/script.lua"
-local expected = "PASTE_SHA256_HASH_HERE"
-local src = game:HttpGet(url)
+            'Loadstring with Integrity Hash': '''local url="https://raw.githubusercontent.com/User/Repo/main/script.lua"
+local expected="PASTE_SHA256_HASH_HERE"
+local src=game:HttpGet(url)
 local function getHash(d)
-    if crypt  and crypt.hash      then return crypt.hash(d) end
+    if crypt and crypt.hash then return crypt.hash(d) end
     if hashlib and hashlib.sha256 then return hashlib.sha256(d) end
 end
-local hash = getHash(src)
-if hash and hash ~= expected then
-    error("[Loader] Integrity check FAILED!", 2)
-end
+local hash=getHash(src)
+if hash and hash~=expected then error("[Loader] Integrity check FAILED!",2) end
 loadstring(src)()
 ''',
             'require() by Asset ID': '''-- Replace 0000000000 with the actual ModuleScript asset ID
-local mod = require(0000000000)
+local mod=require(0000000000)
 -- mod:Init()
 -- mod:Start()
 ''',
@@ -2743,49 +2173,6 @@ local mod = require(0000000000)
         self.find_replace_dialog.show()
         self.find_replace_dialog.raise_()
         self.find_replace_dialog.activateWindow()
-    
-    def show_obfuscator(self):
-        """Show the obfuscator dialog and obfuscate code."""
-        editor = self.get_current_editor()
-        if not editor:
-            return
-        code = editor.get_text()
-        if not code.strip():
-            QMessageBox.warning(self, "Empty Editor", "No code to obfuscate.")
-            return
-        dialog = ObfuscatorDialog(self)
-        if dialog.exec():
-            options = dialog.get_options()
-            try:
-                QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-                self.statusBar().showMessage("Obfuscating code...")
-                obfuscator = LuaObfuscator(options)
-                obfuscated_code = obfuscator.obfuscate(code)
-                new_tab_name = "Obfuscated"
-                if hasattr(editor, 'file_path') and editor.file_path:
-                    original_name = os.path.basename(editor.file_path)
-                    new_tab_name = f"{original_name} (Obfuscated)"
-                new_editor = self.create_new_tab(new_tab_name)
-                # Delay set_text until Monaco is ready in the new tab
-                QTimer.singleShot(600, lambda: new_editor.set_text(obfuscated_code))
-                QApplication.restoreOverrideCursor()
-                self.statusBar().showMessage("Code obfuscated successfully!", 3000)
-                techniques = []
-                if options.get('proxify_locals'): techniques.append("Proxify Locals")
-                if options.get('vmify'):          techniques.append("Vanta (LZW+XOR-OP+Opaque)")
-                extra = f"\n\nPrometheus steps applied: {', '.join(techniques)}" if techniques else ""
-                QMessageBox.information(
-                    self,
-                    "Obfuscation Complete",
-                    f"Code has been obfuscated and opened in a new tab.\n\n"
-                    f"Original size: {len(code)} characters\n"
-                    f"Obfuscated size: {len(obfuscated_code)} characters"
-                    f"{extra}\n\n"
-                    f"Test inside executor to verify functionality"
-                )
-            except Exception as e:
-                QApplication.restoreOverrideCursor()
-                QMessageBox.critical(self, "Obfuscation Error", f"Failed to obfuscate code:\n{str(e)}")
     
     def find_next(self):
         """Trigger Monaco's built-in find widget (next)."""
@@ -3369,6 +2756,179 @@ local mod = require(0000000000)
 
 
     
+    # ── Terminal ───────────────────────────────────────────────────────────────
+
+    def eventFilter(self, obj, event):
+        from PyQt6.QtCore import QEvent
+        if obj is self._term_input and event.type() == QEvent.Type.KeyPress:
+            key = event.key()
+            if key == Qt.Key.Key_Up:
+                if self._term_history and self._term_hist_idx > 0:
+                    self._term_hist_idx -= 1
+                    self._term_input.setText(self._term_history[self._term_hist_idx])
+                return True
+            if key == Qt.Key.Key_Down:
+                self._term_hist_idx = min(self._term_hist_idx + 1, len(self._term_history))
+                if self._term_hist_idx < len(self._term_history):
+                    self._term_input.setText(self._term_history[self._term_hist_idx])
+                else:
+                    self._term_input.clear()
+                return True
+        return super().eventFilter(obj, event)
+
+    def _term_write(self, text, colour=None):
+        if colour:
+            escaped = text.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;').replace(' ','&nbsp;').replace(chr(10),'<br>')
+            self._term_output.appendHtml(f'<span style="color:{colour};">{escaped}</span>')
+        else:
+            self._term_output.appendPlainText(text.rstrip())
+        sb = self._term_output.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def _term_run(self):
+        cmd = self._term_input.text().strip()
+        if not cmd:
+            return
+        if not self._term_history or self._term_history[-1] != cmd:
+            self._term_history.append(cmd)
+        self._term_hist_idx = len(self._term_history)
+        self._term_input.clear()
+        cwd = os.getcwd()
+        self._term_write(f"{cwd} $ {cmd}", colour="#6cb6ff")
+        parts = cmd.split(None, 1)
+        if parts[0] == "cd":
+            target = os.path.expandvars(os.path.expanduser(parts[1].strip() if len(parts) > 1 else "~"))
+            try:
+                os.chdir(target)
+                self._term_cwd_label.setText(os.getcwd())
+            except Exception as e:
+                self._term_write(str(e), colour="#f97583")
+            return
+        if parts[0] in ("clear", "cls"):
+            self._term_clear(); return
+        self._term_kill()
+        self._term_process = QProcess(self)
+        self._term_process.setWorkingDirectory(os.getcwd())
+        self._term_process.setProcessEnvironment(QProcessEnvironment.systemEnvironment())
+        self._term_process.readyReadStandardOutput.connect(self._term_on_stdout)
+        self._term_process.readyReadStandardError.connect(self._term_on_stderr)
+        self._term_process.finished.connect(self._term_on_finished)
+        if sys.platform == "win32":
+            self._term_process.start("cmd.exe", ["/c", cmd])
+        else:
+            self._term_process.start("/bin/sh", ["-c", cmd])
+
+    def _term_on_stdout(self):
+        self._term_write(bytes(self._term_process.readAllStandardOutput()).decode("utf-8","replace"))
+
+    def _term_on_stderr(self):
+        self._term_write(bytes(self._term_process.readAllStandardError()).decode("utf-8","replace"), colour="#f97583")
+
+    def _term_on_finished(self, code, _):
+        self._term_write(f"[exited {code}]", colour="#888")
+        self._term_process = None
+
+    def _term_kill(self):
+        if self._term_process and self._term_process.state() != QProcess.ProcessState.NotRunning:
+            self._term_process.kill()
+            self._term_process.waitForFinished(500)
+            self._term_process = None
+
+    def _term_clear(self):
+        self._term_output.clear()
+
+    # ── DLL Bridge ─────────────────────────────────────────────────────────────
+
+    def _bridge_set_status(self, ok: bool):
+        if ok:
+            self._lbl_bridge_status.setStyleSheet("color:#3fb950;font-size:10pt;")
+            self._lbl_bridge_status.setToolTip("Bridge: connected")
+        else:
+            self._lbl_bridge_status.setStyleSheet("color:#f85149;font-size:10pt;")
+            self._lbl_bridge_status.setToolTip("Bridge: not connected")
+
+    def _bridge_send(self, script: str) -> bool:
+        """
+        4-byte LE uint32 length prefix + UTF-8 payload.
+        DLL side: ReadFile/recv the 4-byte header, then read that many bytes.
+        """
+        payload = script.encode("utf-8")
+        data    = struct.pack("<I", len(payload)) + payload
+        try:
+            if sys.platform == "win32":
+                import ctypes, ctypes.wintypes as wt
+                h = ctypes.windll.kernel32.CreateFileW(
+                    self._bridge_pipe, 0x40000000, 0, None, 3, 0, None)
+                if h == wt.HANDLE(-1).value:
+                    return False
+                written = wt.DWORD(0)
+                ctypes.windll.kernel32.WriteFile(h, data, len(data), ctypes.byref(written), None)
+                ctypes.windll.kernel32.CloseHandle(h)
+                return written.value == len(data)
+            else:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                    s.settimeout(2.0)
+                    s.connect(self._bridge_pipe)
+                    s.sendall(data)
+                return True
+        except Exception:
+            return False
+
+    def _bridge_push(self, silent=False):
+        editor = self.get_current_editor()
+        if not editor:
+            if not silent: QMessageBox.warning(self, "Bridge", "No active editor.")
+            return
+        script = editor.get_text().strip()
+        if not script:
+            if not silent: QMessageBox.warning(self, "Bridge", "Editor is empty.")
+            return
+        ok = self._bridge_send(script)
+        self._bridge_set_status(ok)
+        if not silent:
+            if ok:
+                self.statusBar().showMessage("Script pushed to executor.", 2000)
+            else:
+                QMessageBox.warning(self, "Bridge",
+                    f"Could not connect to:\n{self._bridge_pipe}\n\n"
+                    "Make sure your executor DLL is listening on the pipe.")
+
+    def _bridge_push_file(self, path: str):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                script = f.read()
+        except Exception as e:
+            self.statusBar().showMessage(f"[Bridge] Read error: {e}", 3000); return
+        ok = self._bridge_send(script)
+        self._bridge_set_status(ok)
+        self.statusBar().showMessage(
+            f"[Bridge] Auto-pushed {os.path.basename(path)}" + ("" if ok else " -- pipe not connected"), 2500)
+
+    def _bridge_ext_changed(self, path: str):
+        if path not in self._bridge_watcher.files():
+            self._bridge_watcher.addPath(path)
+        self._bridge_push_file(path)
+
+    def _bridge_show_settings(self):
+        dlg = _BridgeSettingsDialog(self,
+            pipe=self._bridge_pipe,
+            auto_push=self._bridge_auto_push,
+            ext_path=self._bridge_ext_path)
+        if not dlg.exec():
+            return
+        cfg = dlg.get_config()
+        self._bridge_pipe      = cfg["pipe"]
+        self._bridge_auto_push = cfg["auto_push"]
+        if self._bridge_watcher.files():
+            self._bridge_watcher.removePaths(self._bridge_watcher.files())
+        self._bridge_ext_path = cfg["ext_path"]
+        if self._bridge_ext_path and os.path.isfile(self._bridge_ext_path):
+            self._bridge_watcher.addPath(self._bridge_ext_path)
+            self.statusBar().showMessage(f"[Bridge] Watching {self._bridge_ext_path}", 2500)
+        ok = self._bridge_send("")
+        self._bridge_set_status(ok)
+
+
 if __name__ == '__main__':
     app = QApplication(sys.argv)
     ide = LuaIDE()
